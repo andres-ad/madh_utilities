@@ -1,0 +1,490 @@
+---
+title: "CNV estimation"
+author: "Andres Aranda-Diaz, Eric Neubauer Vickers, Manuel Garcia"
+date: "2024-08-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(mgcv)
+library(ggbeeswarm)
+library(gridExtra)
+
+```
+
+
+The following variables need to be set by the user
+```{r}
+
+# Indicate path to allele data files. Currently needs to be the path to the directory where all results are stored
+# i.e., within this path there are bioinformatic pipeline directories 
+allele.data.path = "G:/My Drive/EPPIcenter/Data/CNV/CNV shared/TestData/"
+
+# Indicate path to manifest indicating library preparation SuperBatches, Batches and controls. 
+# Batch: a group of samples prepped together
+# SuperBatch: a group of Batches where the controls (and samples) look reasonably similar
+# Note that controls within a SuperBatch will be averaged and used to correct samples within that SuperBatch
+# Columns are SampleID, CNVControl (TRUE/FALSE), Batch (numbers), SuperBatch (numbers)
+
+# NOTE: CNVControl refers to controls known NOT to have a CNV
+
+manifest.path = "G:/My Drive/EPPIcenter/Data/CNV/CNV shared/TestData/manifest.csv"
+
+
+# Indicate path to loci info (RDS file with amplicon info, loci of interest, loci to filter and pool1A52 contents)
+target.info.path = "G:/My Drive/EPPIcenter/Data/CNV/CNV shared/loci_info_062824.RDS"
+
+# Set thresholds to filter samples for total reads in each pool and total number of amplicons with at least 10 reads
+Pool1A5.threshold = 4000 # total number of reads in pools 1A+5 combined
+Pool2.threshold = 400 # total number of reads in pool 2
+N10.threshold = 180 # total number of amplicons with at least 10 reads
+Pools.ratio = 100 # maximum difference (fold change) between reads in the 2 reactions
+
+# Unespecific amplification: check that your data doesn't have other alleles that result from
+# unespecific amplification. If so, add them to the filters here. If the string is detected in the pseudoCIGAR
+# those reads are removed:
+unespecific.amplification=list()
+unespecific.amplification["Pf3D7_08_v3-1375025-1375284-1B"]  = "10G"
+unespecific.amplification["PmUG01_12_v1-1397996-1398245-1AB"] = "14T26T35T"
+# Note that these are not currently necessary as the Pf3D7_08_v3-1375025-1375284-1B target is removed due to its variability and low amplification efficiency
+# and the non-Pf targets are not used for CNV flagging
+
+```
+
+
+Loading data
+```{r}
+
+# Load files
+
+# List all allele_data files in the directories within the specified path 
+files = list.files(path = allele.data.path,pattern = "allele_data",recursive = T,full.names = T)
+# Define function to add filename as column in collated allele_data data frame
+read_and_add_filename <- function(file) {
+  data <- read.delim(file)
+  data$filename <- file
+  data$run  <- basename(dirname(file))
+  return(data)
+}
+
+# Collate all allele_data outputs
+allele.data <- files %>% 
+  map_df(read_and_add_filename) 
+
+# Change column names if necessary (old versions had lower case column names) 
+if(any(colnames(allele.data) != c("SampleID","Locus","ASV","Reads","Allele","PseudoCIGAR","filename","Run"))){
+  colnames(allele.data) = c("SampleID","Locus","ASV","Reads","Allele","PseudoCIGAR","filename","Run") 
+}
+
+# Load manifest
+if (grepl("\\.csv$", manifest.path)) {
+  manifest <- read.csv(manifest.path)
+} else if (grepl("\\.xlsx$", manifest.path)) {
+  manifest <- read_xlsx(manifest.path)
+} else {
+  stop("Manifest should be either a csv or xlsx file")
+}
+
+# Load locus information
+target.info = readRDS(target.info.path)
+target.info$loci.of.interest = target.info$loci.of.interest %>% filter(locus%in%target.info$locus.filter) # remove loci (targets) of interest as per filtered targets
+
+# Targets of interest and Gene (Group) they correspond to 
+target.of.interest = target.info$loci.of.interest %>% 
+  rename(Locus="locus",Group="group") 
+# Targets in Pools 1A, 5 or 2
+pool1A52 = target.info$pool1A52
+# Original amplicon.info tsv file
+amplicon.info = target.info$amplicon.info
+# list of filtered targets
+target.filter = target.info$locus.filter
+
+```
+
+
+Filter and reshape data
+```{r}
+
+# Remove unespecific amplifications, amplicons not in 1A52 and species detection amplicons
+allele.data.clean = allele.data %>% 
+  filter(Locus %in% pool1A52, ! str_detect(Locus,"1AB")) %>% 
+  filter(Locus %in% target.filter)
+for (target.filter.unespecific in names(unespecific.amplification)) {
+  pattern = unespecific.amplification[[target.filter.unespecific]]
+  allele.data.clean = allele.data.clean %>%
+    filter(!(Locus == !!target.filter.unespecific & str_detect(PseudoCIGAR, pattern)))
+}
+
+# Calculate the reads for each amplicon from the sum of all filtered reads
+target.counts = allele.data.clean %>% 
+  select(SampleID,filename,Run) %>%   # Samples can have the same SampleID across runs
+  distinct() %>% 
+  cross_join(tibble(Locus = target.filter)) %>%  # add all targets so we get NA's for the ones that don't show in allele table
+  left_join(
+    allele.data.clean %>% 
+      group_by(SampleID,Locus) %>% 
+      summarize(Reads = sum(Reads),.groups = 'drop') , # Get total number of reads per locus 
+    by= c("SampleID","Locus")
+  ) %>% 
+  mutate(Reads = ifelse(is.na(Reads),0,Reads)) %>%  # Make NA reads 0's
+  mutate(Pool = sapply(str_split(Locus,"-"),tail,1), # Get primer pool from Locus name
+         Reaction = substr(Pool,1,1)) %>%  # Get reaction from pool name
+  mutate(Pool = ifelse(Pool == "1B","1Bor5",Pool)) %>% 
+  group_by(Run,SampleID,Reaction) %>% 
+  mutate(Total.Reads.Reaction = sum(Reads)) %>% # Get total number of reads per reaction
+  group_by(Run,SampleID) %>% 
+  mutate(Total.Reads = sum(Reads), N10 = sum(Reads>10)) %>%  # Get total number of reads per sample, and the number of targets with at least 10 reads
+  ungroup() %>% 
+  left_join(target.of.interest,by="Locus") %>%  # Add information on the targets of interest (what Group they belong to)
+  mutate(Group = ifelse(is.na(Group),"NONE",Group)) %>% 
+  left_join(amplicon.info %>% select(amplicon,amplicon_length),by = c("Locus"="amplicon")) %>% 
+  left_join(manifest,by=c("SampleID","Run"))
+
+# Add columns for each target of interest Group and make them 1 for the corresponding targets
+for (group.loci in unique(target.of.interest$Group)) {
+  target.counts = target.counts %>%
+    mutate(!!group.loci := ifelse(Group == !!group.loci, 1, 0))
+}
+
+
+# Identify low coverage samples based on thresholds set above
+samples.filtered = target.counts %>% 
+  select(SampleID,filename,Run,SuperBatch,Batch,CNVControl,Reaction,Total.Reads.Reaction,N10) %>% 
+  distinct() %>% 
+  pivot_wider(names_from = Reaction,values_from = Total.Reads.Reaction) %>% 
+  rename(Pool1A5 = "1", Pool2= "2") %>%  
+  filter(Pool1A5>Pool1A5.threshold & Pool2>Pool2.threshold & N10>N10.threshold &
+           Pool1A5/Pool2 < Pools.ratio & Pool2/Pool1A5<Pools.ratio) 
+
+# Filter out low coverage samples from targets.count data frame based on thresholds set above
+target.counts.filtered = target.counts %>% 
+  left_join(samples.filtered %>% 
+              select(SampleID,filename,Run) %>% 
+              mutate(marker=1),
+            by=join_by(SampleID,filename,Run)) %>% 
+  filter(marker==1) %>% 
+  select(-marker)
+
+
+```
+
+
+Visually inspect filtering done on samples
+```{r}
+
+# Generate plot with total number of reads and number of amplicons with at least 10 reads
+# Colors are taken from manifext
+plots = list()
+plots[[1]] = ggplot(target.counts %>%
+                      select(SampleID,Reaction,Total.Reads,N10,CNVControl) %>% 
+                      distinct() %>% 
+                      mutate(FilteredInSample= SampleID %in% samples.filtered$SampleID))+
+  geom_point(aes(x = Total.Reads,y=N10,
+                 color = FilteredInSample,
+                 fill = CNVControl),
+             shape=21,
+             stroke =1)+
+  scale_x_log10()+
+  geom_hline(aes(yintercept = N10.threshold))+
+  scale_color_manual(values=c("grey","black"))+
+  theme(aspect.ratio = 1)+
+  xlab("Total reads per sample")+
+  ylab("Number of amplicons with > 10 reads")
+
+plots[[2]] = ggplot(target.counts %>%
+                      select(SampleID,Reaction,Total.Reads.Reaction,CNVControl) %>% 
+                      distinct() %>% 
+                      mutate(FilteredInSample= SampleID %in% samples.filtered$SampleID) %>% 
+                      pivot_wider(names_from = Reaction,values_from = Total.Reads.Reaction) %>% 
+                      rename(Reaction1 = "1",Reaction2 = "2"))+
+  geom_point(aes(x = Reaction1,y=Reaction2,
+                 color = FilteredInSample,
+                 fill = CNVControl),
+             shape=21,
+             stroke =1)+
+  scale_x_log10()+
+  scale_y_log10()+
+  geom_vline(aes(xintercept = Pool1A5.threshold))+
+  geom_hline(aes(yintercept = Pool2.threshold))+
+  scale_color_manual(values=c("grey","black"))+
+  coord_fixed(ratio=1)+
+  xlab("Reads in reaction 1")+
+  ylab("Reads in reaction 2")
+
+
+grid.arrange(grobs = plots, nrow = 2,ncol=1)
+
+```
+
+```{r}
+# Summary of number of samples per batch and class
+summary = target.counts.filtered %>% 
+  group_by(SuperBatch,CNVControl) %>% 
+  summarise(n = n_distinct(SampleID)) %>% 
+  mutate(CNVControl = ifelse(CNVControl, "# CNV controls","# non-CNV controls")) %>% 
+  pivot_wider(names_from = CNVControl,values_from = n,values_fill = 0)
+
+# Display the summary
+summary  %>%
+  kableExtra::kable() %>% 
+  kableExtra::kable_styling(bootstrap_options = c("striped", "condensed"))
+
+if(nrow(summary %>%
+        group_by(SuperBatch) %>% 
+        mutate(`Control-TRUE`=sum(`# CNV controls`)) %>% 
+        filter(`Control-TRUE`==0))){
+  paste("SuperBatch(s) with no CNV controls:",
+        paste((summary %>%
+                 group_by(SuperBatch) %>% 
+                 mutate(`# CNV controls`=sum(`# CNV controls`)) %>% 
+                 filter(`# CNV controls`==0))$SuperBatch,collapse=" "),
+        ". Consider reassigning."
+  )
+}
+
+```
+Define estCNV function
+```{r}
+estCNV <- function(data, sample.name="<sample>", verbose=F, k.gam=3,
+                   plot.gam = F,
+                   get.correction.factor = F,
+                   target.info = NULL,
+                   ...){
+  
+  # Make Pool and Reaction factors (Reaction no longer used as per formula below)
+  data = data %>% 
+    mutate(Pool.factor = as.factor(Pool),
+           Reaction.factor = as.factor(Reaction))
+  
+  # Get a list of groups of targets to report fold changes on
+  group.of.interest.list = unique(target.info$loci.of.interest$group)
+  
+  # Define formula (spline the same for all groups, with Groups and Pools as variables)
+  form <- as.formula(paste("Reads ~ s(amplicon_length, k=k.gam) + Pool.factor +",
+                           paste(group.of.interest.list,collapse=" + ")))
+  
+  # Get fit
+  fit <- gam(form, data=data, family="poisson")
+  
+  
+  if(get.correction.factor){  # This is run for controls (to get fold change in targets of interest to later normalize)
+    
+    # Make prediction frame to make plots with all data 
+    pred.frame = expand_grid(amplicon_length=seq(floor(min(data$amplicon_length)),
+                                                 ceiling(max(data$amplicon_length))),
+                             Pool.factor = unique(data$Pool.factor))%>% 
+      mutate(Reaction.factor = as.factor(substr(Pool.factor,1,1)))
+    for (group.loci in group.of.interest.list) {
+      pred.frame = pred.frame %>%
+        mutate(!!group.loci := 0)
+    }
+    
+    # Get predicted reads
+    pred.frame$Reads = predict(fit,pred.frame,type="response")
+    
+    
+    # Make a prediction frame for the targets we want residuals for
+    targets.to.correct = target.info$loci.of.interest %>% 
+      rename(Locus="locus",Group="group") %>% 
+      filter(Locus %in% target.info$locus.filter) %>% 
+      mutate(Pool = sapply(str_split(Locus,"-"),tail,1),
+             Reaction = substr(Pool,1,1)) %>% 
+      mutate(Pool = ifelse(Pool == "1B","1Bor5",Pool)) %>% 
+      left_join(amplicon.info %>% select(amplicon,amplicon_length),by = c("Locus"="amplicon")) 
+    for (group.loci in unique(target.info$loci.of.interest$group)) {
+      targets.to.correct = targets.to.correct %>%
+        mutate(!!group.loci := 0) # When getting correction factor don't use Groups as variable 
+    }
+    
+    
+    targets.to.correct = targets.to.correct %>% 
+      mutate(Pool.factor = as.factor(Pool),
+             Reaction.factor = as.factor(Reaction))
+    targets.to.correct$ExpectedReads =round(predict(fit, newdata = targets.to.correct,type="response"))
+    
+    # Make a data frame with the predicted values and get the observed fold change with respect to expected
+    data.prediction = data %>%
+      filter(Group %in% group.of.interest.list) %>% 
+      left_join(targets.to.correct %>% select(Locus,ExpectedReads),
+                by = "Locus") %>% 
+      mutate(FoldChange = Reads/ExpectedReads) %>% 
+      select(SampleID,Group,Locus,Reads,ExpectedReads,FoldChange)
+    
+    # Make a plot with the fit, per Pool
+    plot.data <- ggplot() +
+      geom_point(data = data, aes(x = amplicon_length, y = Reads, color = Group),alpha=1) +
+      scale_color_manual(values = c("NONE" = "darkgray",
+                                    "HRP2_DD2" = "darksalmon",
+                                    "HRP2_P4" = "firebrick4",
+                                    "HRP2_P34" = "firebrick3",
+                                    "HRP3_P34" = "darkorchid3",
+                                    "MDR1" = "dodgerblue4",
+                                    "PM" = "darkgoldenrod"))+
+      geom_line(data = pred.frame, aes(x = amplicon_length, y = Reads),color="black")+
+      facet_wrap(~Pool.factor) +
+      ggtitle(paste("Sample:", sample.name,"\nRun:",data$Run[1],"Batch:",data$Batch[1]))+
+      theme(legend.position = "right",
+            plot.title = element_text(size = 7),
+            axis.text = element_text(size = 5),
+            axis.title = element_text(size=6),
+            legend.title = element_text(size = 6,hjust=0.5),
+            legend.text = element_text(size = 5, color = "black"),
+            strip.text = element_text(size = 5),
+            legend.key.size = unit(10,"points")
+      )
+    
+    
+    return(list(plot.data,data.prediction))
+  }else{
+    # If the function is used to get the fold change for each target group, return the coeficients
+    coef <- summary(fit)$p.coef[group.of.interest.list]
+    se <- summary(fit)$se[group.of.interest.list]
+    
+    return(list(Group = names(coef),FoldChangeGroup=exp(coef), Coef=coef, SE=se))
+  }
+}
+
+```
+
+Obtain fold changes from controls for correction, and plot fit for controls
+```{r,fig.height=30,fig.width=5}
+
+# Initialize with empty list for plots and tibble for prediction data
+plot.controls = list()
+data.prediction = tibble()
+
+# Get list of controls (taken from manifest)
+controls = samples.filtered %>% 
+  filter(CNVControl) %>% 
+  select(SampleID,Run)
+
+# Iterate over each control
+for(i in 1:nrow(controls)){
+  data = target.counts.filtered %>% 
+    filter(SampleID == controls$SampleID[i] & Run == controls$Run[i]) %>% 
+    mutate(Reads = ifelse(Reads==0,1,Reads)) # since the correction factor needs to be a number, make 0's 1
+  control_name = paste(controls$SampleID[i],controls$Run[i])
+  # Get fold change for targets of interest 
+  output = estCNV(data,sample.name = control_name,plot.gam = T,get.correction.factor = T,target.info = target.info)
+  plot.controls[control_name] = output[1]
+  data.prediction = rbind(data.prediction,
+                          output[[2]] %>% 
+                            mutate(Run = controls$Run[i])%>% 
+                            mutate(Locus.Group = paste(Group,Locus))
+  )
+}
+# Add data from manifest
+data.prediction = data.prediction %>% 
+  left_join(manifest,by = join_by(SampleID,Run))
+
+# Display all plots
+grid.arrange(grobs = plot.controls, nrow = length(plot.controls))
+
+```
+
+Obtain and visualize fold changes to be used to correct
+```{r}
+
+# Get median fold change for each target across controls in a SuperBatch
+data.prediction.median = data.prediction %>% 
+  group_by(Locus,SuperBatch,Group) %>% 
+  summarize(MedianFoldChange = median(FoldChange),.groups = 'drop') %>% 
+  mutate(Locus.Group = paste(Group,Locus))
+
+# Plot Fold changes for each SuperBatch (colors = batch, cross = median)
+ggplot(data.prediction)+
+  geom_point(aes(x=Locus.Group,y = FoldChange,color = as.factor(Batch)))+
+  geom_point(data = data.prediction.median,aes(x=Locus.Group,y = MedianFoldChange),shape=4,color="black",stroke=1.5)+
+  theme(legend.position = "none",axis.text.x = element_text(size=4,angle = 90, hjust = 1))+
+  guides(color = guide_legend(nrow = length(unique(data.prediction$SampleID))))+
+  ggtitle("Targets of interest in CNV Controls, per batch (color), median in black x")+
+  facet_wrap(~SuperBatch)+
+  xlab("")
+
+# At this point you may want to reassign batches
+
+```
+
+Calculate the fold changes from coefficients in each group of targets 
+```{r}
+
+# Correct the reads in each sample by the correction factor for the targets of interest within the SuperBatch
+target.counts.filtered.corrected = target.counts.filtered %>% 
+  left_join(data.prediction.median,by=c("SuperBatch","Locus","Group")) %>% 
+  mutate(Correction.Factor = ifelse(is.na(MedianFoldChange),1,MedianFoldChange)) %>% 
+  mutate(Reads.Uncorrected = Reads,Reads = round(Reads.Uncorrected/Correction.Factor))
+
+
+
+fold.changes <- map_df(unique(paste(target.counts.filtered.corrected$SampleID, target.counts.filtered.corrected$Run, sep = ":")), function(sample_run) {
+  parts <- strsplit(sample_run, ":")[[1]]
+  sample.name <- parts[1]
+  run.name <- parts[2]
+  data <- filter(target.counts.filtered.corrected, SampleID == sample.name, Run == run.name)
+  output <- estCNV(data, target.info = target.info)
+  tibble(
+    SampleID = sample.name,
+    Run = run.name,
+    Group = output$Group,
+    FoldChangeGroup = output$FoldChangeGroup,
+    coef = output$Coef,
+    se = output$SE
+  )
+})
+
+```
+
+Visualize fold changes
+```{r}
+# To quickly visualize data, make a heatmap of fold changes in each gee of interest
+plots = list()
+plots[[1]] =ggplot(fold.changes %>% 
+                     mutate(sample_run = paste(SampleID,Run)))+
+  geom_tile(aes(y=Group,x=sample_run,fill=FoldChangeGroup))+
+  theme(axis.text.x = element_blank(),
+        axis.text.y = element_text(size=6))+ 
+  scale_fill_gradientn(
+    colors = c("darkblue", "white", "darkred", "darkred"),
+    values = scales::rescale(c(0, 1, 2.5, max(fold.changes$FoldChangeGroup))),
+    limits = c(0, max(fold.changes$FoldChangeGroup))
+  ) 
+
+plots[[2]] =ggplot(fold.changes)+
+  geom_histogram(aes(x=FoldChangeGroup))+
+  facet_wrap(~Group)
+grid.arrange(grobs = plots, nrow = 2,ncol=1)
+```
+```{r}
+# Rename Groups to Genes and, for HRP2 get scores from the maximum of the 2 groups of targets 
+fold.changes.final = fold.changes %>% 
+  filter(Group != "HRP2_DD2") %>% 
+  mutate(Gene = sapply(str_split(Group,"_"),head,1)) %>% 
+  group_by(SampleID,Run,Gene) %>% 
+  summarize(FoldChangeGene = max(FoldChangeGroup,na.rm = T))
+```
+
+```{r}
+# To quickly visualize data, make a heatmap of fold changes in each gene of interest
+plots = list()
+plots[[1]] =ggplot(fold.changes.final %>% 
+                     mutate(sample_run = paste(SampleID,Run)))+
+  geom_tile(aes(x=sample_run,y=Gene,fill=FoldChangeGene))+
+  theme(axis.text.x = element_blank(),
+        axis.text.y = element_text(size=6))+ 
+  scale_fill_gradientn(
+    colors = c("darkblue", "white", "darkred", "darkred"),
+    values = scales::rescale(c(0, 1, 2.5, max(fold.changes.final$FoldChangeGene))),
+    limits = c(0, max(fold.changes.final$FoldChangeGene))
+  ) 
+
+plots[[2]] =ggplot(fold.changes.final)+
+  geom_histogram(aes(x=FoldChangeGene))+
+  facet_wrap(~Gene)
+grid.arrange(grobs = plots, nrow = 2,ncol=1)
+```
+
+
+```
+
